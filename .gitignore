@@ -1,5 +1,12 @@
 .DS_Store
 
+# raw Qualtrics demographics export -- contains participant name/email/IP/DOB, never commit
+MN_simulated_data/ManyNumbers_forsharing_DataEntry_June+14,+2026_17.18.csv
+
+# real participant Give-N data, not yet cleared for the public repo
+MN_simulated_data/BCDLabIL_MN1p032_R_5IQ7nVouxfLCypP_longformgiventaskV01.csv
+MN_simulated_data/BCDLabIL_MN1p032_R_5IQ7nVouxfLCypP_summary_giventaskV01.csv
+
 .Rproj.user
 .Rhistory
 .RData

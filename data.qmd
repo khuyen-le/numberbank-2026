@@ -18,7 +18,197 @@ dataset <- redivis::user("datapages")$dataset("Numberbank")
 hc <- dataset$table("highest count")$to_tibble()
 kld <- dataset$table("knower level")$to_tibble()
 td <- dataset$table("trials")$to_tibble()
+```
 
+```{r import manynumbers give-n}
+# ManyNumbers Give-N import --------------------------------------------------
+# Raw per-participant site exports arrive in pairs, named like:
+#   {site}_{participant}_{qualtrics_id}_longformgiventaskV##.csv  (one row per trial)
+#   {site}_{participant}_{qualtrics_id}_summary_giventaskV##.csv  (pre-computed per-query summary + KnowerLevel)
+# Point mn_giventask_dir at the folder holding all such pairs (currently just
+# the two example files in MN_code/) as more sites' data comes in. This folds
+# ManyNumbers into td's schema below as dataset_id "ManyNumbers".
+mn_giventask_dir <- "MN_simulated_data"
+
+mn_longform_files <- Sys.glob(file.path(mn_giventask_dir, "*_longformgiventaskV*.csv"))
+mn_summary_files  <- Sys.glob(file.path(mn_giventask_dir, "*_summary_giventaskV*.csv"))
+mn_demographics_files <- Sys.glob(file.path(mn_giventask_dir, "ManyNumbers_forsharing_DataEntry_*.csv"))
+
+# Read demographic file.
+# Only age (from Dem_DOB/Dem_DOT), language, country, and gender are pulled
+# in for now.
+read_mn_demographics <- function(path) {
+  raw <- read.csv(path, header = TRUE, stringsAsFactors = FALSE, check.names = FALSE)
+  raw <- raw[-c(1, 2), ] # drop the question-text + ImportId rows
+  raw |>
+    filter(trimws(ResponseId) != "") |>
+    transmute(
+      qualtrics_id = trimws(ResponseId),
+      dob = suppressWarnings(as.Date(Dem_DOB, format = "%m/%d/%y")),
+      dot = suppressWarnings(as.Date(Dem_DOT, format = "%m/%d/%y")),
+      age = as.integer(round(as.numeric(difftime(dot, dob, units = "days")) / 30.4368)), # months
+      gender = Dem_Gender,
+      language = Dem_Language,
+      country = Q10,
+      export_mtime = file.info(path)$mtime
+    )
+}
+
+# multiple exports may exist over time (new Qualtrics downloads); keep the
+# most recently exported row per response
+mn_demographics <- if (length(mn_demographics_files)) {
+  bind_rows(lapply(mn_demographics_files, read_mn_demographics)) |>
+    arrange(qualtrics_id, desc(export_mtime)) |>
+    distinct(qualtrics_id, .keep_all = TRUE) |>
+    select(-export_mtime)
+} else {
+  tibble(qualtrics_id = character(), age = integer(), gender = character(),
+         language = character(), country = character())
+}
+
+read_mn_longform <- function(path) {
+  read.csv(path, stringsAsFactors = FALSE) |>
+    mutate(query = suppressWarnings(as.numeric(gn_Query)),
+           response = suppressWarnings(as.numeric(gn_Response))) |>
+    filter(!is.na(query), !is.na(response)) |>
+    transmute(
+      dataset_id = "ManyNumbers",
+      subject_id = paste(gn_siteid, gn_participant, sep = "_"), 
+      qualtrics_id = trimws(gn_qualtrics_id),
+      method = "non-titrated", # fixed give-n protocol
+      query = query,
+      response = pmin(response, 10) # cap at 10, matching trial_data convention
+    )
+}
+
+# Reshape KL labels into numberbank convention
+label_to_kl <- function(label, cp_threshold = 6) {
+  kl_numeric <- suppressWarnings(as.numeric(gsub("-knower", "", label, ignore.case = TRUE)))
+  kl_numeric[tolower(label) == "pre-knower"] <- 0
+  if_else(is.na(kl_numeric), NA_character_,
+          if_else(kl_numeric >= cp_threshold, "CP-knower", paste0(kl_numeric, "-knower")))
+}
+
+label_to_kl_subset <- function(label, cp_threshold = 6) {
+  kl <- label_to_kl(label, cp_threshold)
+  case_when(
+    is.na(kl) ~ NA_character_,
+    kl == "CP-knower" ~ "CP-knower",
+    kl == "0-knower" ~ "Pre-knower",
+    .default = "Subset-knower"
+  )
+}
+
+read_mn_summary <- function(path) {
+  read.csv(path, stringsAsFactors = FALSE) |>
+    transmute(subject_id = participant, KnowerLevel)
+}
+
+mn_longform_raw <- if (length(mn_longform_files)) bind_rows(lapply(mn_longform_files, read_mn_longform)) else
+  tibble(dataset_id = character(), subject_id = character(), qualtrics_id = character(),
+         method = character(), query = integer(), response = integer())
+
+# Highest Count task, named like {site}_{participant}_{qualtrics_id}_highestcounttask.csv
+mn_hc_files <- Sys.glob(file.path(mn_giventask_dir, "*_highestcounttask.csv"))
+
+read_mn_hc <- function(path) {
+  read.csv(path, stringsAsFactors = FALSE) |>
+    transmute(
+      subject_id = paste(hc_siteid, hc_participant, sep = "_"),
+      qualtrics_id = trimws(hc_qualtrics_id),
+      hc = suppressWarnings(as.numeric(hc_highestcount))
+    ) |>
+    filter(!is.na(hc))
+}
+
+mn_hc <- if (length(mn_hc_files)) bind_rows(lapply(mn_hc_files, read_mn_hc)) else
+  tibble(subject_id = character(), qualtrics_id = character(), hc = numeric())
+
+# combines both sources so a participant who only did the Highest Count task
+# (no Give-N submission) still resolves a qualtrics_id for the demographics
+# lookup below
+mn_subject_qualtrics <- bind_rows(
+  mn_longform_raw |> distinct(subject_id, qualtrics_id),
+  mn_hc |> distinct(subject_id, qualtrics_id)
+) |> distinct(subject_id, qualtrics_id)
+
+# one KnowerLevel per participant (the summary file repeats it once per
+# query row, so take the first)
+mn_summary_kl <- if (length(mn_summary_files)) {
+  bind_rows(lapply(mn_summary_files, read_mn_summary)) |>
+    group_by(subject_id) |>
+    summarise(KnowerLevel = first(KnowerLevel), .groups = "drop")
+} else {
+  tibble(subject_id = character(), KnowerLevel = character())
+}
+
+# kld-shaped table for ManyNumbers: every subject who has either a Give-N
+# summary or a Highest Count submission (or both), same as how Numberbank's
+# own kld can have kl-only, hc-only, or both -- with age/language/country
+# merged in from demographics via qualtrics_id
+mn_kld <- full_join(mn_summary_kl, mn_hc |> select(subject_id, hc), by = "subject_id") |>
+  left_join(mn_subject_qualtrics, by = "subject_id") |>
+  left_join(mn_demographics |> select(qualtrics_id, age, language, country), by = "qualtrics_id") |>
+  transmute(
+    dataset_id = "ManyNumbers",
+    subject_id,
+    age,
+    language,
+    country,
+    method = "non-titrated",
+    kl = label_to_kl(KnowerLevel),
+    kl_subset = label_to_kl_subset(KnowerLevel),
+    hc
+  )
+
+# trial-level ManyNumbers rows also need kl/kl_subset attached (from mn_kld
+# above) -- td's own kl/kl_subset columns are what the Plots -- Items tab
+# filters trials by, so without this every ManyNumbers trial silently fails
+# that filter and never renders there, no matter how much data exists
+mn_td <- mn_longform_raw |>
+  left_join(mn_demographics |> select(qualtrics_id, age, language, country), by = "qualtrics_id") |>
+  left_join(mn_kld |> select(subject_id, kl, kl_subset), by = "subject_id") |>
+  select(dataset_id, subject_id, method, age, language, country, query, response, kl, kl_subset)
+
+# combined trial-level data: Numberbank's own td plus the newly imported
+# ManyNumbers trials, in the same shape
+td_all <- bind_rows(td, mn_td)
+
+# datasets not yet in kld at all: currently just ManyNumbers, whose kl comes
+# from mn_kld above (built from the site's own summary file) rather than the
+# recalculation below. 
+# td also has several older studies with no kld rows yet
+# (e.g. Krajcsi2018, Sarnecka2007, the Boni/Marchand/Wagner sets), we might 
+# need to address that
+new_datasets <- c("ManyNumbers")
+```
+
+```{r recalculate kl}
+source("data/kl_calc_mn.R")
+source("data/helpers/mn_gn_knowerlevel_details.R")
+
+# recalculate_kl_mn(_details) match trials into sessions by exact age, and
+# NA != NA, so give ManyNumbers rows a fake age for this call only
+# where their real (demographics-derived) age is still missing. Note
+# ManyNumbers' kl in kl_final comes from mn_kld (the summary file), not from
+# this recalculation -- this is only run so we have a from-raw-trials
+# cross-check (mn_kl_qc below) and so existing kld-tracked datasets keep
+# working exactly as before.
+td_for_recalc <- td_all |> mutate(age = if_else(dataset_id %in% new_datasets & is.na(age), -1L, age))
+kl_recalc <- recalculate_kl_mn(td_for_recalc, hc)
+kl_recalc_details <- recalculate_kl_mn_details(td_for_recalc)
+
+# QC check: does recomputing kl from raw trial responses agree with the
+# KnowerLevel the site's own summary file already gives us (the value we
+# actually use, via mn_kld)?
+mn_kl_qc <- kl_recalc |>
+  filter(dataset_id == "ManyNumbers") |>
+  select(-age) |>
+  left_join(mn_kld |> select(subject_id, kl_from_summary = kl), by = "subject_id") |>
+  mutate(kl_match = kl == kl_from_summary)
+```
+
+```{r}
 # replacement language values
 language_recode <- list(
   "Arabic" = "Saudi",
@@ -28,7 +218,8 @@ language_recode <- list(
   "Slovenian (non-dual)" = c("Slovenian", "Slovenian_nonDual", "Serbian/Slovenian")
 )
 
-languages_countries <- kld |>
+languages_countries <- bind_rows(kld |> select(language, country), td_all |> select(language, country)) |>
+  distinct() |>
   mutate(# recode + sort languages
          lang = language |> fct_collapse(!!!language_recode) |> fct_relevel(sort),
          # combination of language and country
@@ -42,12 +233,77 @@ languages_countries <- kld |>
          country_languages = glue("{country} – {country_languages}")) |>
   ungroup()
 
-kl_data <- kld |>
+# a study/method is eligible for the recalculated knower level only if it
+# uses a non-titrated method and tests all of the numbers 1 through 6
+kl_source_eligibility <- td_all |>
+  group_by(dataset_id, method) |>
+  summarise(tests_1_to_6 = all(1:6 %in% query), .groups = "drop") |>
+  mutate(use_recalc = method == "non-titrated" & tests_1_to_6) |>
+  select(dataset_id, method, use_recalc)
+
+# some older studies were uploaded to the "trials" table (td) but were never
+# given an official row in the "knower level" table (kld) at all -- so they
+# don't show up anywhere in the knower-level plots, even though we have their
+# raw trial data. Add them to kld here using the same recalculation already
+# computed above (kl_recalc), restricted to the same eligibility rule used
+# everywhere else (kl_source_eligibility): non-titrated, and testing all of
+# 1 through 6.
+# This added 4 datasets to the list.
+kld_gap_datasets <- setdiff(unique(td$dataset_id), unique(kld$dataset_id))
+
+kld_gap_rows <- kl_recalc |>
+  filter(dataset_id %in% kld_gap_datasets) |>
+  semi_join(kl_source_eligibility |> filter(use_recalc), by = c("dataset_id", "method")) |>
+  select(dataset_id, subject_id, age, language, country, method, kl, kl_subset, hc)
+
+kld <- bind_rows(kld, kld_gap_rows)
+
+# td's own kl/kl_subset should also reflect the recalculated classification
+# when eligible, so Plots -- Items (which reads straight from
+# trial_data/td_all) stays consistent with Plots -- Knower levels (which
+# reads kl_data/kl_final) for the same trials. ManyNumbers is excluded here
+# since it already got its authoritative kl merged in from its own summary
+# files above (see mn_td) -- recomputing it from trial responses would
+# override that on-purpose choice.
+td_all <- td_all |>
+  left_join(kl_source_eligibility, by = c("dataset_id", "method")) |>
+  mutate(use_recalc = coalesce(use_recalc, FALSE) & !(dataset_id %in% new_datasets)) |>
+  left_join(
+    kl_recalc |> select(dataset_id, subject_id, age, method, kl_recalc = kl, kl_subset_recalc = kl_subset),
+    by = c("dataset_id", "subject_id", "age", "method")
+  ) |>
+  mutate(
+    kl = if_else(use_recalc & !is.na(kl_recalc), kl_recalc, kl),
+    kl_subset = if_else(use_recalc & !is.na(kl_recalc), kl_subset_recalc, kl_subset)
+  ) |>
+  select(-use_recalc, -kl_recalc, -kl_subset_recalc)
+
+# kld left untouched; kl_final swaps in the recalculated kl/kl_subset only for
+# eligible study/methods, falling back to kld's values everywhere else
+# NOTE: this only affects Piantadosi & Gibson's data, because they only ask each kid for 1 trial per number.
+kl_final <- bind_rows(
+  kld |>
+    left_join(kl_source_eligibility, by = c("dataset_id", "method")) |>
+    mutate(use_recalc = coalesce(use_recalc, FALSE)) |>
+    left_join(
+      kl_recalc |> select(dataset_id, subject_id, age, method, kl_recalc = kl, kl_subset_recalc = kl_subset),
+      by = c("dataset_id", "subject_id", "age", "method")
+    ) |>
+    mutate(
+      kl = if_else(use_recalc & !is.na(kl_recalc), kl_recalc, kl),
+      kl_subset = if_else(use_recalc & !is.na(kl_recalc), kl_subset_recalc, kl_subset)
+    ) |>
+    select(-use_recalc, -kl_recalc, -kl_subset_recalc),
+  # MN gets KL from own summary files, 
+  mn_kld
+)
+
+kl_data <- kl_final |>
   filter(!is.na(kl) | !is.na(hc)) |> # remove rows with both kl and hc NA
   left_join(languages_countries) |> mutate(language = lang) |> select(-lang) |>
   arrange(language, kl, age)
 
-trial_data <- td |>
+trial_data <- td_all |>
   mutate(response = if_else(response > 10, 10, response)) |> # cap responses at 10
   left_join(languages_countries) |> mutate(language = lang) |> select(-lang)
   # mutate(# recode + sort languages
@@ -56,10 +312,207 @@ trial_data <- td |>
   #        language_country = paste(language, country, sep = "\n"))
 ```
 
+```{r import manynumbers ams+vm}
+# ManyNumbers Dot Comparison (AMS) + Visual Memory (VM) import --------------
+# Raw per-participant site exports are named like:
+#   {site}_{participant}_{id}_amstaskorganizedfile.csv  (one row per AMS trial)
+#   {site}_{participant}_{id}_vmtaskorganizedfile.csv   (one row per VM trial)
+# Unlike the Give-N/demographics files, these carry their own age/language
+# columns directly (age_years/age_months/Language) and have no qualtrics id
+# of their own -- see manynumbers_datadictionary_030326_V01.pdf. Country
+# isn't part of either file, so it's backfilled from the Give-N demographics
+# import above where the same subject_id also has a Give-N submission; a
+# subject with AMS/VM data but no Give-N/demographics (e.g. a lone AMS-only
+# submission) will end up with country = NA and so won't match any
+# country/language sidebar filter.
+mn_ams_files <- Sys.glob(file.path(mn_giventask_dir, "*_amstaskorganizedfile.csv"))
+mn_vm_files  <- Sys.glob(file.path(mn_giventask_dir, "*_vmtaskorganizedfile.csv"))
+
+read_mn_ams <- function(path) {
+  read.csv(path, stringsAsFactors = FALSE) |>
+    filter(block %in% c("block1", "block2", "block3")) |> # experimental trials only, drop sample/practice
+    transmute(
+      dataset_id = "ManyNumbers",
+      subject_id = paste(SiteID, participant, sep = "_"),
+      age = suppressWarnings(as.numeric(age_months)),
+      language = Language,
+      numRatio = suppressWarnings(as.numeric(numRatio)),
+      accuracy = suppressWarnings(as.numeric(accuracy)),
+      rt = suppressWarnings(as.numeric(rt))
+    ) |>
+    filter(!is.na(accuracy))
+}
+
+read_mn_vm <- function(path) {
+  read.csv(path, stringsAsFactors = FALSE) |>
+    transmute(
+      dataset_id = "ManyNumbers",
+      subject_id = paste(SiteID, participant, sep = "_"),
+      age = suppressWarnings(as.numeric(age_months)),
+      language = Language,
+      clicks = suppressWarnings(as.numeric(clicks)),
+      accuracy = suppressWarnings(as.numeric(accuracy)),
+      rt = suppressWarnings(as.numeric(rt))
+    ) |>
+    filter(!is.na(accuracy))
+}
+
+mn_ams_raw <- if (length(mn_ams_files)) bind_rows(lapply(mn_ams_files, read_mn_ams)) else
+  tibble(dataset_id = character(), subject_id = character(), age = numeric(),
+         language = character(), numRatio = numeric(), accuracy = numeric(), rt = numeric())
+
+mn_vm_raw <- if (length(mn_vm_files)) bind_rows(lapply(mn_vm_files, read_mn_vm)) else
+  tibble(dataset_id = character(), subject_id = character(), age = numeric(),
+         language = character(), clicks = numeric(), accuracy = numeric(), rt = numeric())
+
+# country + knower level backfilled by subject_id from the Give-N import
+# above (mn_subject_qualtrics/mn_demographics/mn_kld); a subject with no
+# Give-N submission gets NA for both, same caveat as above for country
+mn_subject_country <- mn_subject_qualtrics |>
+  left_join(mn_demographics |> select(qualtrics_id, country), by = "qualtrics_id") |>
+  distinct(subject_id, country)
+
+mn_subject_kl <- mn_kld |> distinct(subject_id, kl, kl_subset)
+
+# split the (language, country) lookup in two so a subject with no country
+# (no matching Give-N submission to backfill it from) still resolves a
+# recoded language/language_countries -- language_countries is aggregated
+# per language across all its countries, so it doesn't actually need country
+# to be known. Only language_country/country_languages genuinely require it
+# and stay NA without one.
+lang_lookup <- languages_countries |> distinct(language, lang, language_countries)
+country_lookup <- languages_countries |> distinct(language, country, language_country, country_languages)
+
+attach_mn_lookups <- function(df) {
+  df |>
+    left_join(mn_subject_country, by = "subject_id") |>
+    left_join(mn_subject_kl, by = "subject_id") |>
+    left_join(lang_lookup, by = "language") |>
+    left_join(country_lookup, by = c("language", "country")) |>
+    mutate(language = lang) |>
+    select(-lang)
+}
+
+ams_data <- mn_ams_raw |> attach_mn_lookups()
+vm_data <- mn_vm_raw |> attach_mn_lookups()
+```
+
+```{r}
+td_subjects <- td |> distinct(dataset_id, subject_id)
+kld_subjects <- kld |> distinct(dataset_id, subject_id)
+
+# in td but not in kld
+only_in_td <- td_subjects |> anti_join(kld_subjects, by = c("dataset_id", "subject_id"))
+
+# in kld but not in td
+only_in_kld <- kld_subjects |> anti_join(td_subjects, by = c("dataset_id", "subject_id"))
+
+# combined, labeled with which dataset each came from
+diff_subjects <- bind_rows(
+  only_in_td |> mutate(in_dataset = "td_only"),
+  only_in_kld |> mutate(in_dataset = "kld_only")
+)
+```
+
+```{r compare with existing kld}
+# subjects present in both
+comparison <- kld |>
+  select(dataset_id, subject_id, age, method, kl_kld = kl, kl_subset_kld = kl_subset) |>
+  inner_join(
+    kl_recalc |> select(dataset_id, subject_id, age, method, kl_recalc = kl, kl_subset_recalc = kl_subset),
+    by = c("dataset_id", "subject_id", "age", "method")
+  )
+
+# subjects missing from one side or the other
+only_in_kld <- kld |> anti_join(kl_recalc, by = c("dataset_id", "subject_id", "age", "method"))
+only_in_recalc <- kl_recalc |> anti_join(kld, by = c("dataset_id", "subject_id", "age", "method"))
+
+# the actual disagreements, for closer inspection
+mismatches <- comparison |> filter(kl_kld != kl_recalc)
+```
+
+```{r}
+library(tidyr)
+# long format: one row per study x method x number, with trial count
+study_query_summary <- td_all |>
+  count(dataset_id, method, query, name = "n_trials") |>
+  arrange(dataset_id, method, query)
+
+# wide format: one row per study x method, one column per number asked
+study_query_wide <- study_query_summary |>
+  pivot_wider(names_from = query, values_from = n_trials, values_fill = 0, names_prefix = "query_")
+
+# compact summary: just the set of numbers each study/method asked for
+study_query_range <- td_all |>
+  group_by(dataset_id, method) |>
+  summarise(numbers_asked = paste(sort(unique(query)), collapse = ", "), .groups = "drop")
+```
+
+```{r dataset browser summary}
+# one row per dataset, computed from what's already loaded above (kl_data +
+# td_all) -- feeds the preview panel built into the "Datasets" filter below.
+# Built from kl_data (not kl_final) so this always matches exactly the set of
+# datasets the filter itself offers.
+dataset_kl_summary <- kl_data |>
+  group_by(dataset_id) |>
+  summarise(
+    n_subjects = n(),
+    age_min = { v <- suppressWarnings(min(age, na.rm = TRUE)); if (is.infinite(v)) NA_integer_ else v },
+    age_max = { v <- suppressWarnings(max(age, na.rm = TRUE)); if (is.infinite(v)) NA_integer_ else v },
+    methods = paste(sort(unique(method)), collapse = ", "),
+    languages = paste(sort(unique(na.omit(language))), collapse = ", "),
+    countries = paste(sort(unique(na.omit(country))), collapse = ", "),
+    n_pre = sum(kl_subset == "Pre-knower", na.rm = TRUE),
+    n_subset = sum(kl_subset == "Subset-knower", na.rm = TRUE),
+    n_cp = sum(kl_subset == "CP-knower", na.rm = TRUE),
+    n_classified = sum(!is.na(kl)),
+    n_with_hc = sum(!is.na(hc)),
+    .groups = "drop"
+  )
+
+dataset_trial_summary <- td_all |>
+  group_by(dataset_id) |>
+  summarise(
+    has_trial_data = TRUE,
+    n_trials = n(),
+    numbers_tested = paste(sort(unique(query)), collapse = ", "),
+    .groups = "drop"
+  )
+
+# use these functions to populate the dataset filter with badges denoting 
+# which dataset includes which task.
+dataset_ams_summary <- ams_data |>
+  group_by(dataset_id) |>
+  summarise(n_with_ams = n_distinct(subject_id), .groups = "drop")
+
+dataset_vm_summary <- vm_data |>
+  group_by(dataset_id) |>
+  summarise(n_with_vm = n_distinct(subject_id), .groups = "drop")
+
+# curated description/citation/link, filled in by hand from
+# data/study_metadata_template.csv -- most rows are still blank (only
+# ManyNumbers has real content so far), which the preview panel below shows
+# as the usual "no description on file yet" empty state
+study_metadata <- read.csv("study_metadata_template.csv", stringsAsFactors = FALSE, na.strings = "") |>
+  rename(title_override = title)
+
+dataset_browser_data <- dataset_kl_summary |>
+  left_join(dataset_trial_summary, by = "dataset_id") |>
+  mutate(has_trial_data = coalesce(has_trial_data, FALSE)) |>
+  left_join(dataset_ams_summary, by = "dataset_id") |>
+  left_join(dataset_vm_summary, by = "dataset_id") |>
+  mutate(n_with_ams = coalesce(n_with_ams, 0L), n_with_vm = coalesce(n_with_vm, 0L)) |>
+  left_join(study_metadata, by = "dataset_id") |>
+  arrange(title_override)
+```
+
 ```{r}
 ojs_define(hc = hc)
 ojs_define(kl_data = kl_data)
 ojs_define(trial_data = trial_data)
+ojs_define(dataset_browser_data = dataset_browser_data)
+ojs_define(ams_data = ams_data)
+ojs_define(vm_data = vm_data)
 ```
 
 ```{ojs}
@@ -73,6 +526,274 @@ filter_error = '<p class="filter-error"><i class="bi bi-exclamation-triangle"></
 
 kl = transpose(kl_data)
 tr = transpose(trial_data)
+ams = transpose(ams_data)
+vm = transpose(vm_data)
+```
+
+```{ojs}
+// dataset preview panel, built into the "Datasets" filter below -----------
+dp_raw = transpose(dataset_browser_data)
+
+dp_pct = (part, whole) => whole > 0 ? Math.round((part / whole) * 100) : 0
+
+dp_datasets = dp_raw.map(r => {
+  const c = r.n_classified || 1;
+  return {
+    id: r.dataset_id,
+    title: r.title_override || r.dataset_id.replace(/_/g, " "),
+    description: r.short_description,
+    citation: r.citation,
+    link: r.link,
+    n: r.n_subjects,
+    ageMin: r.age_min, ageMax: r.age_max,
+    languages: r.languages ? r.languages.split(", ") : [],
+    countries: r.countries ? r.countries.split(", ") : [],
+    methods: r.methods ? r.methods.split(", ").map(m => "Give-N · " + m) : [],
+    numbersTested: r.numbers_tested,
+    hasTrialData: r.has_trial_data,
+    nTrials: r.n_trials,
+    nWithHc: r.n_with_hc,
+    nWithAms: r.n_with_ams, 
+    nWithVm: r.n_with_vm, 
+    isLiveImport: r.dataset_id === "ManyNumbers",
+    kl: { pre: dp_pct(r.n_pre, c), subset: dp_pct(r.n_subset, c), cp: dp_pct(r.n_cp, c) },
+  };
+})
+```
+
+```{ojs}
+html`<style>
+  .dp-wrap { font-size: 0.82rem; }
+  .dp-search { width: 100%; border: 1px solid #dee2e6; background: #fff; border-radius: 5px;
+               padding: 0.3rem 0.45rem; font-size: 0.8rem; font-family: inherit; margin-bottom: 0.4rem; }
+  .dp-count { font-size: 0.68rem; color: #6c757d; display: block; margin-bottom: 0.3rem; }
+  .dp-list { list-style: none; margin: 0; padding: 0; max-height: 360px; overflow-y: auto;
+             border: 1px solid #dee2e6; border-radius: 6px; }
+  .dp-item + .dp-item { border-top: 1px solid #eee; }
+  .dp-row { display: grid; grid-template-columns: auto 1fr auto auto; align-items: center; gap: 0.4rem;
+            padding: 0.32rem 0.4rem; }
+  .dp-row:hover { background: #cecece; } /* same gray Chrome uses for a selected option in the language/country multi-selects */
+  .dp-row input[type="checkbox"] { accent-color: #859900; width: 13px; height: 13px; margin: 0; flex: none; }
+  /* Quarto auto-adds .btn.btn-quarto to bare <button> elements, whose own
+     :hover/:focus background (a dark slate gray) otherwise wins over the
+     rules below by specificity -- !important keeps these buttons
+     transparent so the lighter .dp-row:hover gray above shows through
+     instead of that dark default. */
+  .dp-row-title-btn,
+  .dp-row-title-btn:hover,
+  .dp-row-title-btn:focus,
+  .dp-row-title-btn:active { min-width: 0; text-align: left; background: none !important; border: none; padding: 0; cursor: pointer;
+                 font: inherit; color: inherit !important; width: 100%; box-shadow: none !important; }
+  .dp-row-title-btn:hover .dp-row-title { color: #556b00; }
+  .dp-row-title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }
+  .dp-row-sub { font-size: 0.68rem; color: #8a8f96; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }
+  .dp-microbar { display: flex; width: 30px; height: 6px; border-radius: 999px; overflow: hidden;
+                 border: 1px solid #dee2e6; flex: none; }
+  .dp-microbar span { display: block; height: 100%; }
+  .dp-details-btn,
+  .dp-details-btn:hover,
+  .dp-details-btn:focus,
+  .dp-details-btn:active { flex: none; font-size: 0.66rem; font-weight: 600; color: #556b00 !important; background: none !important;
+                     border: 1px solid #859900; border-radius: 5px; padding: 0.16rem 0.4rem; cursor: pointer; box-shadow: none !important; }
+  .dp-details-btn:hover { background: #eef2dc !important; }
+  .dp-details-btn[aria-expanded="true"],
+  .dp-details-btn[aria-expanded="true"]:hover { background: #859900 !important; color: #fff !important; }
+  .dp-expand { padding: 0.55rem 0.6rem 0.7rem; background: #f8f9fa; border-top: 1px dashed #dee2e6; }
+  .dp-badge-row { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-bottom: 0.5rem; }
+  .dp-badge { font-weight: 600; padding: 0.15rem 0.45rem; border-radius: 999px;
+              background: #eef2dc; border: 1px solid #859900; color: #4c5e00; }
+  .dp-note { border: 1px dashed #dee2e6; border-radius: 5px; padding: 0.4rem 0.55rem;
+             margin-bottom: 0.55rem; color: #8a8f96; }
+  .dp-note.live { border: 1px solid #859900; border-style: solid; background: #eef2dc; color: #212529; }
+  .dp-desc { margin-bottom: 0.55rem; }
+  .dp-fact { margin: 0 0 0.3rem; color: #495057; }
+  .dp-fact b { color: #212529; }
+  .dp-fact a { color: #556b00; word-break: break-all; }
+  .dp-citation { font-style: italic; color: #6c757d; }
+  .dp-kl-bar { display: flex; width: 100%; height: 14px; border-radius: 4px; overflow: hidden; border: 1px solid #dee2e6; margin-top: 0.5rem; }
+  .dp-kl-bar span { display: block; height: 100%; }
+  .filter-allnone-row { display: flex; gap: 0.4rem; margin: 0.2rem 0 0.5rem; }
+  .filter-allnone-btn { font-size: 0.68rem; font-weight: 600; color: #556b00 !important; background: none;
+                       border: 1px solid #859900 !important; border-radius: 5px; padding: 0.12rem 0.45rem; cursor: pointer; }
+  .filter-allnone-btn:hover { background: #eef2dc !important; }
+  .export-row { margin: 0 0 1rem; }
+  .export-btn { font-size: 0.78rem; font-weight: 600; color: #fff; background: #859900;
+                border: 1px solid #859900; border-radius: 6px; padding: 0.35rem 0.75rem; cursor: pointer; }
+  .export-btn:hover { background: #6e8000; }
+  .export-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .export-note { font-size: 0.72rem; color: #8a8f96; margin: 0.3rem 0 0; }
+</style>`
+```
+
+```{ojs}
+dp_klColor = ({ pre: "#2a78d6", subset: "#eb6834", cp: "#1baf7a" })
+
+function dp_klBar(d, height) {
+  return html`<div class="dp-kl-bar" style=${{height: height + "px"}}>
+    <span title=${"Pre-knower " + d.kl.pre + "%"} style=${{width: d.kl.pre + "%", background: dp_klColor.pre}}></span>
+    <span title=${"Subset-knower " + d.kl.subset + "%"} style=${{width: d.kl.subset + "%", background: dp_klColor.subset}}></span>
+    <span title=${"CP-knower " + d.kl.cp + "%"} style=${{width: d.kl.cp + "%", background: dp_klColor.cp}}></span>
+  </div>`;
+}
+
+function dp_expandContent(d) {
+  const hasCuratedInfo = !!(d.description || d.citation || d.link);
+
+  const curatedBlock = hasCuratedInfo
+    ? html`<div class="dp-desc">
+        ${d.description ? html`<p class="dp-fact">${d.description}</p>` : ""}
+        ${d.citation ? html`<p class="dp-fact dp-citation">${d.citation}</p>` : ""}
+        ${d.link ? html`<p class="dp-fact"><a href=${d.link} target="_blank" rel="noopener noreferrer">${d.link}</a></p>` : ""}
+      </div>`
+    : html`<div class="dp-note">No study description, citation, or link on file yet.</div>`;
+
+  const liveNote = d.isLiveImport
+    ? html`<div class="dp-note live"><strong>Live import.</strong> Grows automatically as new
+        ManyNumbers site submissions arrive — currently ${d.n} participants across ${d.countries.length} sites.</div>`
+    : "";
+
+  const trialFact = d.hasTrialData
+    ? html`<p class="dp-fact"><b>${d.nTrials?.toLocaleString()}</b> trials logged${d.numbersTested ? html` · numbers tested <b>${d.numbersTested}</b>` : ""}</p>`
+    : html`<p class="dp-fact">no trial-by-trial data on file</p>`;
+
+  return html`<div class="dp-expand">
+    <div class="dp-badge-row">${[
+    ...d.methods,
+    ...(d.nWithAms > 0 ? ["Dot Comparison"] : []),
+    ...(d.nWithVm > 0 ? ["Visual Memory"] : []),
+  ].map(m => html`<span class="dp-badge">${m}</span>`)}</div>
+    ${curatedBlock}
+    ${liveNote}
+    <p class="dp-fact"><b>${d.n}</b> participants${d.ageMin != null ? html` · ages <b>${d.ageMin}–${d.ageMax} mo</b>` : ""}</p>
+    <p class="dp-fact">Languages: ${d.languages.length ? d.languages.join(", ") : "—"}</p>
+    <p class="dp-fact">Countries: ${d.countries.length ? d.countries.join(", ") : "—"}</p>
+    ${trialFact}
+    ${d.nWithHc > 0 ? html`<p class="dp-fact">Highest Count on file for <b>${d.nWithHc}</b> of ${d.n} participants</p>` : ""}
+  </div>`;
+}
+
+// wraps any Inputs.select(..., {multiple: true}) view with "All"/"None"
+// buttons that set its value and fire the same input event Observable's
+// reactivity expects, so viewof cells built from this stay wired up exactly
+// like the Inputs.select they wrap
+function withAllNoneButtons(view, allValues) {
+  const allBtn = html`<button type="button" class="filter-allnone-btn">All</button>`;
+  const noneBtn = html`<button type="button" class="filter-allnone-btn">None</button>`;
+
+  allBtn.addEventListener("click", () => {
+    view.value = allValues.slice();
+    view.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  noneBtn.addEventListener("click", () => {
+    view.value = [];
+    view.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+
+  const btnRow = html`<div class="filter-allnone-row">${allBtn}${noneBtn}</div>`;
+  const wrap = html`<div>${view}${btnRow}</div>`;
+  wrap.value = view.value;
+  view.addEventListener("input", () => {
+    wrap.value = view.value;
+    wrap.dispatchEvent(new Event("input"));
+  });
+  return wrap;
+}
+
+// custom Observable view: either the checkbox or the study's title toggles
+// whether that dataset_id is included in the real filters below
+// (klf/trf/hcf), exactly like the Inputs.select this replaces. A separate
+// "Study details" button expands an inline preview, accordion-style,
+// without changing what's included.
+function datasetPicker(datasets, defaultIds) {
+  const root = html`<div class="dp-wrap"></div>`;
+  const included = new Set(defaultIds);
+  let expandedId = null;
+
+  const search = html`<input class="dp-search" type="text" placeholder="Filter datasets…">`;
+  const countLabel = html`<span class="dp-count"></span>`;
+  const list = html`<ul class="dp-list"></ul>`;
+
+  function notify() {
+    root.value = Array.from(included);
+    root.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  // "All"/"None" always apply to the full dataset list, not just whatever
+  // the search box currently narrows the visible rows down to
+  const allBtn = html`<button type="button" class="filter-allnone-btn">All</button>`;
+  const noneBtn = html`<button type="button" class="filter-allnone-btn">None</button>`;
+  allBtn.addEventListener("click", () => {
+    for (const d of datasets) included.add(d.id);
+    render();
+    notify();
+  });
+  noneBtn.addEventListener("click", () => {
+    included.clear();
+    render();
+    notify();
+  });
+  const btnRow = html`<div class="filter-allnone-row">${allBtn}${noneBtn}</div>`;
+
+  function render() {
+    const q = search.value.trim().toLowerCase();
+    const filtered = datasets.filter(d => {
+      if (!q) return true;
+      const hay = [d.title, d.id, ...d.languages, ...d.countries].join(" ").toLowerCase();
+      return hay.includes(q);
+    });
+
+    countLabel.textContent = `${included.size} of ${datasets.length} included`;
+    list.replaceChildren();
+
+    for (const d of filtered) {
+      const li = html`<li class="dp-item"></li>`;
+
+      const cb = html`<input type="checkbox">`;
+      cb.checked = included.has(d.id);
+      cb.ariaLabel = `Include ${d.title}`;
+
+      function setIncluded(isIncluded) {
+        cb.checked = isIncluded;
+        if (isIncluded) included.add(d.id); else included.delete(d.id);
+        countLabel.textContent = `${included.size} of ${datasets.length} included`;
+        notify();
+      }
+
+      cb.addEventListener("change", () => setIncluded(cb.checked));
+
+      const titleBtn = html`<button type="button" class="dp-row-title-btn">
+        <span class="dp-row-title">${d.title}</span>
+        <span class="dp-row-sub">${d.id} · n=${d.n}</span>
+      </button>`;
+      titleBtn.addEventListener("click", () => setIncluded(!cb.checked));
+
+      const microBar = dp_klBar(d, 6);
+      microBar.className = "dp-microbar dp-kl-bar";
+
+      const detailsBtn = html`<button type="button" class="dp-details-btn">${expandedId === d.id ? "Hide" : "Details"}</button>`;
+      detailsBtn.setAttribute("aria-expanded", expandedId === d.id);
+      detailsBtn.addEventListener("click", () => {
+        expandedId = expandedId === d.id ? null : d.id;
+        render();
+      });
+
+      const row = html`<div class="dp-row"></div>`;
+      row.append(cb, titleBtn, microBar, detailsBtn);
+
+      li.append(row);
+      if (expandedId === d.id) li.append(dp_expandContent(d));
+
+      list.append(li);
+    }
+  }
+
+  search.addEventListener("input", render);
+  root.append(search, btnRow, countLabel, list);
+  render();
+
+  root.value = Array.from(included);
+  return root;
+}
 ```
 
 ::: {.panel-sidebar}
@@ -96,43 +817,142 @@ viewof ages = interval([d3.min(kl_data.age), d3.max(kl_data.age)],
                        {step: 1, label: "Age (months)"})
 
 // kl filter
-cp_sort = (a, b) => a === "CP-knower" ? 1 : b === "CP-knower" ? -1 : a.localeCompare(b);
-kl_vals = Array.from(new Set(kl_data.kl)).sort(cp_sort) // options
+// explicit developmental order, covering both kl's values (0-5-knower,
+// Subset-knower -- kld does have some rows only classified at that generic
+// level, not a specific number -- and CP-knower) and kl_subset's values
+// (Pre-knower, Subset-knower, CP-knower); falls back to alphabetical for
+// anything unexpected so a new/unseen label doesn't silently disappear
+kl_rank_order = ["Pre-knower", "0-knower", "1-knower", "2-knower", "3-knower",
+                  "4-knower", "5-knower", "Subset-knower", "CP-knower"]
+// some rows have kl = null (e.g. a subject with Highest Count data but no
+// classifiable Give-N submission) -- those still need to sort somewhere
+// without crashing on localeCompare(null); null always sorts last.
+cp_sort = (a, b) => {
+  if (a == null && b == null) return 0;
+  if (a == null) return 1;
+  if (b == null) return -1;
+  const ia = kl_rank_order.indexOf(a), ib = kl_rank_order.indexOf(b);
+  if (ia === -1 || ib === -1) return a.localeCompare(b);
+  return ia - ib;
+}
+kl_vals = Array.from(new Set(kl_data.kl)).filter(v => v != null).sort(cp_sort) // options -- null excluded, it's not a selectable knower level
 kl_defs = kl_vals.filter(s => /^[123C]/.test(s)) // default
-viewof kls = Inputs.select(kl_vals, {label: "Knower levels", multiple: true, value: kl_defs})
+viewof kls = withAllNoneButtons(Inputs.select(kl_vals, {label: "Knower levels", multiple: true, value: kl_defs}), kl_vals)
 
 // kl subset toggle
 viewof kl_sub = Inputs.checkbox(["Group non-CP-knowers together"])
 kl_y = kl_sub.length ? "kl_subset" : "kl"
 
+// method filter (titrated vs. non-titrated)
+method_vals = Array.from(new Set(kl_data.method)).sort() // options
+viewof methods = Inputs.checkbox(method_vals, {label: "Method", value: method_vals})
+
 // language filter
 lang_vals = Array.from(new Set(kl_data.language_countries)).sort() // options
 lang_defs = lang_vals.filter(s => /English/.test(s))
-viewof langs = Inputs.select(lang_vals, {label: "Languages", multiple: true, value: lang_defs})
+viewof langs = withAllNoneButtons(Inputs.select(lang_vals, {label: "Languages", multiple: true, value: lang_defs}), lang_vals)
 
-// country filter
+// country filter f
 country_vals = Array.from(new Set(kl_data.country_languages)).sort() // options
 country_defs = country_vals.filter(s => /English/.test(s))
-viewof countries = Inputs.select(country_vals, {label: "Countries", multiple: true, value: country_defs})
+viewof countries = withAllNoneButtons(Inputs.select(country_vals, {label: "Countries", multiple: true, value: country_defs}), country_vals)
 
-// dataset filter
+// dataset filter -- checkbox list with an inline per-study preview
+// (dp_datasets/datasetPicker are defined above, before the sidebar)
 dataset_vals = Array.from(new Set(kl_data.dataset_id)).sort() // options
 dataset_defs = dataset_vals // default
-viewof datasets = Inputs.select(dataset_vals, {label: "Datasets", multiple: true, value: dataset_defs})
+viewof datasets = {
+  const label = html`Datasets`;
+  const picker = datasetPicker(dp_datasets, dataset_defs);
+  const wrap = html`<div>${label}${picker}</div>`;
+  wrap.value = picker.value;
+  picker.addEventListener("input", () => {
+    wrap.value = picker.value;
+    wrap.dispatchEvent(new Event("input"));
+  });
+  return wrap;
+}
 ```
 
 ```{ojs}
-// filter data using inputs (except age)
+// filter data using inputs (except age). This tab is specifically about
+// knower level, so a row with no classifiable kl (e.g. Highest-Count-only
+// submissions) never matches any kls selection -- it has no knower level to
+// show here. (Highest Count below re-derives its own filtered set from `kl`
+// so those rows aren't lost there.)
 klf = kl.filter(d => langs.includes(d.language_countries))
         .filter(d => countries.includes(d.country_languages))
         .filter(d => datasets.includes(d.dataset_id))
         .filter(d => kls.includes(d.kl))
+        .filter(d => methods.includes(d.method))
         .filter(d => d.age >= ages[0] && d.age <= ages[1])
 
 // possible kl values in filtered data
-klfv = Array.from(new Set(klf.map(d => d[kl_y]))).sort(cp_sort)
+klfv = Array.from(new Set(klf.map(d => d[kl_y]))).filter(v => v != null).sort(cp_sort)
 
 kl_found = klf.length > 0
+```
+
+```{ojs}
+// export: current view's data as CSV, plus an R snippet that reproduces the
+// same filtered subset from the live pipeline -----------------------------
+function downloadText(filename, text, mime = "text/plain") {
+  const blob = new Blob([text], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+// R character-vector literal from an array of strings
+function rVec(values) {
+  const esc = s => `"${String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  if (values.length === 0) return "character(0)";
+  return `c(${values.map(esc).join(", ")})`;
+}
+
+// the R equivalent of the sidebar filters currently applied to klf/trf,
+// exactly as they're applied in JS above -- extraLines lets a view (e.g.
+// Highest Count) add its own additional condition (e.g. !is.na(hc))
+function buildFilterRCode(baseVar, extraLines = []) {
+  const lines = [
+    `filter(language_countries %in% ${rVec(langs)})`,
+    `filter(country_languages %in% ${rVec(countries)})`,
+    `filter(dataset_id %in% ${rVec(datasets)})`,
+    `filter(kl %in% ${rVec(kls)})`,
+    `filter(method %in% ${rVec(methods)})`,
+    `filter(age >= ${ages[0]}, age <= ${ages[1]})`,
+    ...extraLines,
+  ];
+  return `${baseVar} |>\n  ${lines.join(" |>\n  ")}`;
+}
+
+// viewLabel: short slug for filenames. baseVar: "kl_data" or "trial_data" --
+// the R object the snippet re-filters. rows: the already-filtered JS array
+// (klf/trf/hcf) to write out as CSV. extraLines: additional R filter() calls
+// beyond the standard sidebar filters (e.g. Highest Count's !is.na(hc)).
+function exportView(viewLabel, baseVar, rows, extraLines = []) {
+  downloadText(`numberbank_${viewLabel}.csv`, d3.csvFormat(rows), "text/csv");
+
+  const rCode = `# Numberbank -- ${viewLabel}
+# Generated ${new Date().toISOString()} from the filters selected on this page.
+#
+# This reproduces the *live* filtered subset from the pipeline (needs the
+# numberbank-2026 repo and Redivis access -- see data/load_numberbank.R).
+# For a fixed snapshot of exactly what you saw, use the CSV downloaded
+# alongside this file instead -- the live data may have grown since then.
+
+source("data/load_numberbank.R")
+library(dplyr)
+
+${viewLabel}_data <- ${buildFilterRCode(baseVar, extraLines)}
+`;
+  downloadText(`numberbank_${viewLabel}.R`, rCode);
+}
 ```
 
 :::
@@ -150,6 +970,14 @@ kl_found = klf.length > 0
 ::: {.disclaimer}
 {{< include md/disclaimer-kl.md >}}
 :::
+
+```{ojs}
+{
+  const btn = html`<button type="button" class="export-btn" ${kl_found ? "" : "disabled"}>Export this view</button>`;
+  btn.addEventListener("click", () => exportView("knower_levels", "kl_data", klf));
+  return html`<div class="export-row">${btn}<p class="export-note">Downloads a CSV of the data shown below, and an R script that reproduces this filtered selection.</p></div>`;
+}
+```
 
 ```{ojs}
 html`${kl_found ? '' : filter_error}`
@@ -239,9 +1067,18 @@ trf = tr.filter(d => langs.includes(d.language_countries))
         .filter(d => countries.includes(d.country_languages))
         .filter(d => datasets.includes(d.dataset_id))
         .filter(d => kls.includes(d.kl))
+        .filter(d => methods.includes(d.method))
         .filter(d => d.age >= ages[0] && d.age <= ages[1])
 
 tr_found = trf.length > 0
+```
+
+```{ojs}
+{
+  const btn = html`<button type="button" class="export-btn" ${tr_found ? "" : "disabled"}>Export this view</button>`;
+  btn.addEventListener("click", () => exportView("items", "trial_data", trf));
+  return html`<div class="export-row">${btn}<p class="export-note">Downloads a CSV of the ${trf.length} trials shown below, plus an R script that reproduces this filtered selection.</p></div>`;
+}
 ```
 
 ```{ojs}
@@ -292,7 +1129,7 @@ tr_found ? Plot.plot({
 
 :::
 
-## Highest count
+## Highest Count
 
 ::: {.panel-tabset .nav-pills}
 
@@ -303,8 +1140,25 @@ tr_found ? Plot.plot({
 :::
 
 ```{ojs}
-hcf = klf.filter(s => s.hc)
+// built from `kl` (not klf) since Highest Count isn't gated on having a
+// classifiable knower level -- a null kl always passes here, matching the
+// same-shaped filters on amsf/vmf below.
+hcf = kl.filter(d => langs.includes(d.language_countries))
+        .filter(d => countries.includes(d.country_languages))
+        .filter(d => datasets.includes(d.dataset_id))
+        .filter(d => kls.includes(d.kl))
+        .filter(d => methods.includes(d.method))
+        .filter(d => d.age >= ages[0] && d.age <= ages[1])
+        .filter(d => d.hc)
 hc_found = hcf.length > 0
+```
+
+```{ojs}
+{
+  const btn = html`<button type="button" class="export-btn" ${hc_found ? "" : "disabled"}>Export this view</button>`;
+  btn.addEventListener("click", () => exportView("highest_count", "kl_data", hcf, ["filter(!is.na(hc))"]));
+  return html`<div class="export-row">${btn}<p class="export-note">Downloads a CSV of the ${hcf.length} rows shown below, plus an R script that reproduces this filtered selection.</p></div>`;
+}
 ```
 
 ```{ojs}
@@ -408,6 +1262,333 @@ hc_found ? Plot.plot({
 ### Data
 
 <iframe width="100%" height="800" allowfullscreen src="https://redivis.com/embed/tables/1ts7-1cm8mteff"></iframe>
+
+:::
+
+## Dot Comparison
+
+::: {.panel-tabset .nav-pills}
+
+### Plots
+
+::: {.disclaimer}
+{{< include md/disclaimer-ams.md >}}
+:::
+
+```{ojs}
+amsf = ams.filter(d => kls.includes(d.kl))
+          .filter(d => langs.includes(d.language_countries))
+          .filter(d => langs.includes(d.language_countries))
+          .filter(d => countries.includes(d.country_languages))
+          .filter(d => datasets.includes(d.dataset_id))
+          .filter(d => d.age >= ages[0] && d.age <= ages[1])
+
+ams_found = amsf.length > 0
+```
+
+```{ojs}
+{
+  const btn = html`<button type="button" class="export-btn" ${ams_found ? "" : "disabled"}>Export this view</button>`;
+  btn.addEventListener("click", () => exportView("dot_comparison", "ams_data", amsf));
+  return html`<div class="export-row">${btn}<p class="export-note">Downloads a CSV of the data shown below, and an R script that reproduces this filtered selection.</p></div>`;
+}
+```
+
+```{ojs}
+html`${ams_found ? '' : filter_error}`
+```
+
+```{ojs}
+// one row per participant: mean accuracy across their experimental trials,
+// plus the demographics/knower-level carried on every trial row
+ams_subj = Array.from(
+  d3.rollup(amsf, v => ({
+    accuracy: d3.mean(v, d => d.accuracy),
+    age: v[0].age,
+    dataset_id: v[0].dataset_id,
+    kl: v[0].kl,
+    kl_subset: v[0].kl_subset
+  }), d => d.subject_id),
+  ([subject_id, d]) => ({ subject_id, ...d })
+)
+```
+
+```{ojs}
+// sample size plot
+ams_found ? Plot.plot({
+  title: "Counts of participants who completed Dot Comparison in each dataset",
+  style: { fontFamily: fontFamily, fontSize: fontSize },
+  marginLeft: ss_margin,
+  x: { label: "", labelAnchor: "center", labelArrow: "none", axis: "top" },
+  y: { label: "Dataset", labelAnchor: "top", tickSize: 0, tickPadding: 2 },
+  marks: [
+    Plot.barX(ams_subj, Plot.groupY(
+      { x: "count" },
+      { y: "dataset_id", inset: 1, sort: { y: "x", reverse: true } }
+    )),
+    Plot.textX(ams_subj, Plot.stackX(Plot.groupY(
+      { x: "count", text: "count" },
+      { y: "dataset_id", fill: "white" }
+    ))),
+  ]
+}) : html``
+```
+
+```{ojs}
+// accuracy by numerical ratio -- the canonical Dot Comparison psychometric curve
+ams_found ? Plot.plot({
+  title: "Dot Comparison accuracy by numerical ratio",
+  style: { fontFamily: fontFamily, fontSize: fontSize },
+  marginRight: 100,
+  x: { label: "Numerical ratio (smaller / larger)", grid: true, domain: [0.4, 1], labelAnchor: "center", labelArrow: "none" },
+  y: { label: "Proportion correct", grid: true, domain: [0, 1], labelAnchor: "center", labelArrow: "none" },
+  facet: { label: null },
+  marks: [
+    Plot.ruleY([0.5], { stroke: "gray", strokeDasharray: "4,2" }),
+    Plot.lineY(amsf, Plot.groupX({ y: "mean" }, { x: "numRatio", y: "accuracy", fy: fy, stroke: "black" })),
+    Plot.dot(amsf, Plot.groupX({ y: "mean" }, { x: "numRatio", y: "accuracy", fy: fy, fill: "black" }))
+  ]
+}) : html``
+```
+
+```{ojs}
+// accuracy over age
+ams_found ? Plot.plot({
+  title: "Dot Comparison accuracy over age",
+  style: { fontFamily: fontFamily, fontSize: fontSize },
+  marginRight: 100,
+  x: { label: age_label, grid: true, inset: 10, line: true, labelAnchor: "center", labelArrow: "none" },
+  y: { label: "Proportion correct", inset: 5, line: true, domain: [0, 1], labelAnchor: "center", labelArrow: "none" },
+  facet: { label: null },
+  marks: [
+    Plot.dot(ams_subj, {
+      x: "age",
+      y: "accuracy",
+      fill: "black",
+      fy: fy
+    })
+  ]
+}) : html``
+```
+
+```{ojs}
+// distribution of accuracy
+ams_found ? Plot.plot({
+  title: "Distribution of Dot Comparison accuracy",
+  style: { fontFamily: fontFamily, fontSize: fontSize },
+  marginRight: 100,
+  x: { label: "Proportion correct", grid: true, inset: 10, line: true, domain: [0, 1], labelAnchor: "center", labelArrow: "none" },
+  y: { line: true, labelAnchor: "center", labelArrow: "none" },
+  facet: { label: null },
+  marks: [
+    Plot.rectY(ams_subj, Plot.binX({ y: "count" }, { x: "accuracy", fy: fy }))
+  ]
+}) : html``
+```
+
+```{ojs}
+// boxplot by knower level (only participants who also have a Give-N-derived
+// knower level -- e.g. a lone AMS-only submission with no Give-N data won't
+// have one, and is left out of this plot only)
+ams_by_kl = ams_subj.filter(d => d.kl)
+ams_kl_found = ams_by_kl.length > 0
+
+ams_kl_found ? Plot.plot({
+  title: "Dot Comparison accuracy by knower level",
+  style: { fontFamily: fontFamily, fontSize: fontSize },
+  marginLeft: 60,
+  marginRight: 100,
+  x: { label: "Proportion correct", grid: true, inset: 10, line: true, domain: [0, 1], labelAnchor: "center", labelArrow: "none" },
+  y: { label: "Knower level", labelAnchor: "top", tickSize: 0, tickPadding: 2, domain: klfv },
+  color: { domain: klfv },
+  facet: { label: null },
+  marks: [
+    Plot.boxX(ams_by_kl, {
+      x: "accuracy",
+      y: kl_y,
+      fy: fy,
+      fill: kl_y
+    })
+  ]
+}) : html``
+```
+
+### Data
+
+```{ojs}
+ams_csv_url = URL.createObjectURL(new Blob([d3.csvFormat(ams)], { type: "text/csv" }))
+```
+
+```{ojs}
+html`<p><a href="${ams_csv_url}" download="manynumbers_dotcomparison_trials.csv" class="btn btn-outline-primary"><i class="bi bi-download"></i> Download full Dot Comparison trial-level data (CSV)</a></p>`
+```
+
+```{ojs}
+Inputs.table(ams, { rows: 15 })
+```
+
+:::
+
+## Visual Memory
+
+::: {.panel-tabset .nav-pills}
+
+### Plots
+
+::: {.disclaimer}
+{{< include md/disclaimer-vm.md >}}
+:::
+
+```{ojs}
+vmf = vm.filter(d => langs.includes(d.language_countries))
+        .filter(d => countries.includes(d.country_languages))
+        .filter(d => datasets.includes(d.dataset_id))
+        .filter(d => kls.includes(d.kl))
+        .filter(d => d.age >= ages[0] && d.age <= ages[1])
+
+vm_found = vmf.length > 0
+```
+
+```{ojs}
+{
+  const btn = html`<button type="button" class="export-btn" ${vm_found ? "" : "disabled"}>Export this view</button>`;
+  btn.addEventListener("click", () => exportView("visual_memory", "vm_data", vmf));
+  return html`<div class="export-row">${btn}<p class="export-note">Downloads a CSV of the data shown below, and an R script that reproduces this filtered selection.</p></div>`;
+}
+```
+
+```{ojs}
+html`${vm_found ? '' : filter_error}`
+```
+
+```{ojs}
+// one row per participant: mean accuracy across their trials, plus the
+// demographics/knower-level carried on every trial row
+vm_subj = Array.from(
+  d3.rollup(vmf, v => ({
+    accuracy: d3.mean(v, d => d.accuracy),
+    age: v[0].age,
+    dataset_id: v[0].dataset_id,
+    kl: v[0].kl,
+    kl_subset: v[0].kl_subset
+  }), d => d.subject_id),
+  ([subject_id, d]) => ({ subject_id, ...d })
+)
+```
+
+```{ojs}
+// sample size plot
+vm_found ? Plot.plot({
+  title: "Counts of participants who completed Visual Memory in each dataset",
+  style: { fontFamily: fontFamily, fontSize: fontSize },
+  marginLeft: ss_margin,
+  x: { label: "", labelAnchor: "center", labelArrow: "none", axis: "top" },
+  y: { label: "Dataset", labelAnchor: "top", tickSize: 0, tickPadding: 2 },
+  marks: [
+    Plot.barX(vm_subj, Plot.groupY(
+      { x: "count" },
+      { y: "dataset_id", inset: 1, sort: { y: "x", reverse: true } }
+    )),
+    Plot.textX(vm_subj, Plot.stackX(Plot.groupY(
+      { x: "count", text: "count" },
+      { y: "dataset_id", fill: "white" }
+    ))),
+  ]
+}) : html``
+```
+
+```{ojs}
+// accuracy by set size -- the Visual Memory analog of a psychometric curve
+vm_found ? Plot.plot({
+  title: "Visual Memory accuracy by set size",
+  style: { fontFamily: fontFamily, fontSize: fontSize },
+  marginRight: 100,
+  x: { label: "Set size (objects)", grid: true, inset: 10, labelAnchor: "center", labelArrow: "none" },
+  y: { label: "Proportion correct", grid: true, domain: [0, 1], labelAnchor: "center", labelArrow: "none" },
+  facet: { label: null },
+  marks: [
+    Plot.ruleY([0.5], { stroke: "gray", strokeDasharray: "4,2" }),
+    Plot.lineY(vmf, Plot.groupX({ y: "mean" }, { x: "clicks", y: "accuracy", fy: fy, stroke: "black" })),
+    Plot.dot(vmf, Plot.groupX({ y: "mean" }, { x: "clicks", y: "accuracy", fy: fy, fill: "black" }))
+  ]
+}) : html``
+```
+
+```{ojs}
+// accuracy over age
+vm_found ? Plot.plot({
+  title: "Visual Memory accuracy over age",
+  style: { fontFamily: fontFamily, fontSize: fontSize },
+  marginRight: 100,
+  x: { label: age_label, grid: true, inset: 10, line: true, labelAnchor: "center", labelArrow: "none" },
+  y: { label: "Proportion correct", inset: 5, line: true, domain: [0, 1], labelAnchor: "center", labelArrow: "none" },
+  facet: { label: null },
+  marks: [
+    Plot.dot(vm_subj, {
+      x: "age",
+      y: "accuracy",
+      fill: "black",
+      fy: fy
+    })
+  ]
+}) : html``
+```
+
+```{ojs}
+// distribution of accuracy
+vm_found ? Plot.plot({
+  title: "Distribution of Visual Memory accuracy",
+  style: { fontFamily: fontFamily, fontSize: fontSize },
+  marginRight: 100,
+  x: { label: "Proportion correct", grid: true, inset: 10, line: true, domain: [0, 1], labelAnchor: "center", labelArrow: "none" },
+  y: { line: true, labelAnchor: "center", labelArrow: "none" },
+  facet: { label: null },
+  marks: [
+    Plot.rectY(vm_subj, Plot.binX({ y: "count" }, { x: "accuracy", fy: fy }))
+  ]
+}) : html``
+```
+
+```{ojs}
+// boxplot by knower level (only participants who also have a Give-N-derived
+// knower level -- e.g. a lone VM-only submission with no Give-N data won't
+// have one, and is left out of this plot only)
+vm_by_kl = vm_subj.filter(d => d.kl)
+vm_kl_found = vm_by_kl.length > 0
+
+vm_kl_found ? Plot.plot({
+  title: "Visual Memory accuracy by knower level",
+  style: { fontFamily: fontFamily, fontSize: fontSize },
+  marginLeft: 60,
+  marginRight: 100,
+  x: { label: "Proportion correct", grid: true, inset: 10, line: true, domain: [0, 1], labelAnchor: "center", labelArrow: "none" },
+  y: { label: "Knower level", labelAnchor: "top", tickSize: 0, tickPadding: 2, domain: klfv },
+  color: { domain: klfv },
+  facet: { label: null },
+  marks: [
+    Plot.boxX(vm_by_kl, {
+      x: "accuracy",
+      y: kl_y,
+      fy: fy,
+      fill: kl_y
+    })
+  ]
+}) : html``
+```
+
+### Data
+
+```{ojs}
+vm_csv_url = URL.createObjectURL(new Blob([d3.csvFormat(vm)], { type: "text/csv" }))
+```
+
+```{ojs}
+html`<p><a href="${vm_csv_url}" download="manynumbers_visualmemory_trials.csv" class="btn btn-outline-primary"><i class="bi bi-download"></i> Download full Visual Memory trial-level data (CSV)</a></p>`
+```
+
+```{ojs}
+Inputs.table(vm, { rows: 15 })
+```
 
 :::
 

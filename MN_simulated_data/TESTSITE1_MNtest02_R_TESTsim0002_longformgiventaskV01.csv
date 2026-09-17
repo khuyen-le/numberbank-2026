@@ -1,0 +1,25 @@
+"gn_participant","gn_siteid","gn_qualtrics_id","gn_was.the.task.completed","gn_yes_date","gn_no_reason","gn_trial","gn_Query","gn_Response_text","gn_Response","gn_accuracy","gn_complete","gn_block","gn_blockcomplete"
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN01",1,"1",1,1,1,"Block1",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN02",2,"2",2,1,1,"Block1",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN03",3,"4",4,0,1,"Block1",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN04",4,"8",8,0,1,"Block1",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN05",5,"3",3,0,1,"Block1",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN06",6,"4",4,0,1,"Block1",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN07",8,"6",6,0,1,"Block1",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN08",10,"5",5,0,1,"Block1",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN09",1,"1",1,1,1,"Block2",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN10",2,"2",2,1,1,"Block2",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN11",3,"6",6,0,1,"Block2",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN12",4,"10",10,0,1,"Block2",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN13",5,"6",6,0,1,"Block2",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN14",6,"10",10,0,1,"Block2",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN15",8,"6",6,0,1,"Block2",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN16",10,"6",6,0,1,"Block2",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN17",1,"1",1,1,1,"Block3",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN18",2,"2",2,1,1,"Block3",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN19",3,"8",8,0,1,"Block3",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN20",4,"3",3,0,1,"Block3",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN21",5,"3",3,0,1,"Block3",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN22",6,"4",4,0,1,"Block3",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN23",8,"4",4,0,1,"Block3",1
+"MNtest02","TESTSITE1","R_TESTsim0002","Yes (Please include date of testing)","9-13-2026","","GN24",10,"5",5,0,1,"Block3",1
